@@ -307,3 +307,285 @@ return chain.filter(exchange).then(Mono.fromRunnable(() -> {
 
 
 
+## Gateway限流
+
+通过限流，有效管理每秒请求数（QPS），保护系统
+
+常见限流方法有：计数器算法、漏桶算法（Leaky Bucket）、令牌桶算法（Token Bucket）
+
+Gateway中官方提供了 RequestRateLimiterGatewayFilterFactory 工厂，通过Redis和Lua脚本，可以实现令牌桶算法
+
+先添加依赖
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis-reactive</artifactId>
+</dependency>
+```
+
+配置限流参数
+
+```yaml
+spring:
+  redis:
+    host: 192.168.84.128
+    port: 6379
+    password:
+  cloud:
+    gateway:
+      discovery:
+        locator:
+          lowerCaseServiceId: true
+          enabled: true
+      routes:
+        # 系统模块
+        - id: pmhub-system
+          uri: lb://pmhub-system
+          predicates:
+            - Path=/system/**
+          filters:
+            - StripPrefix=1
+            - name: RequestRateLimter
+              args:
+              	redis-rate-limiter.replenishRate: 1 # 令牌桶每秒填充速率
+              	redis-rate-limiter.burstCapacity: 2 # 令牌桶总容量
+              	key-resolver: "#{@pathKeyResolver}" # 使用 SpEL 表达式按名称引用 bean
+```
+
+> StripPrefix=1 表示网关转发到业务模块时会自动截取前缀
+
+然后配置限流规则类
+
+```java
+/**
+ * 限流规则配置类
+ * @author hengxing
+ * @version 1.0
+ * @project pmhub
+ * @date 5/6/2025 15:40:04
+ */
+@Configuration
+public class KeyResolverConfiguration {
+
+    @Bean
+    public KeyResolver pathKeyResolver() {
+        return exchange -> Mono.just(exchange.getRequest().getPath().value());
+    }
+}
+```
+
+这样，就可以通过路径来限流
+
+当然也可以使用ip地址和Header及cookie
+
+```java
+@Bean
+public KeyResolver pathKeyResolver() {
+    return exchange -> Mono.just(exchange.getRequest().getRemoteAddress().getAddress().getHostAddress());
+}
+// header中的用户id来限流
+@Bean
+public KeyResolver pathKeyResolver() {
+    return exchange -> Mono.just(exchange.getRequest().getHeaders().getFirst("X-User-Id"));
+}
+// session
+@Bean
+public KeyResolver pathKeyResolver() {
+    return exchange -> Mono.just(exchange.getRequest().getCookies().getFirst("SESSION").getValue());
+}
+```
+
+## Gateway 黑名单
+
+一个禁止访问的URL列表。可以创建一个自定义过滤器`BlackListUrlFilter` 
+
+并配置 blackListUrl。如果又其他需求，还可以实现自定义规则的过滤器
+
+URL的话可以自定义过滤器中增加一个参数blackListUrl，这个参数会在factory的泛型中，作为一个同名的变量
+
+```java
+/**
+ * 黑名单过滤器
+ *
+ * @author canghe
+ */
+@Component
+public class BlackListUrlFilter extends AbstractGatewayFilterFactory<BlackListUrlFilter.Config>
+{
+    @Override
+    public GatewayFilter apply(Config config)
+    {
+        return (exchange, chain) -> {
+
+            String url = exchange.getRequest().getURI().getPath();
+            if (config.matchBlacklist(url))
+            {
+                return ServletUtils.webFluxResponseWriter(exchange.getResponse(), "请求地址不允许访问");
+            }
+
+            return chain.filter(exchange);
+        };
+    }
+
+    public BlackListUrlFilter()
+    {
+        super(Config.class);
+    }
+
+    public static class Config
+    {
+        private List<String> blacklistUrl;
+
+        private List<Pattern> blacklistUrlPattern = new ArrayList<>();
+
+        public boolean matchBlacklist(String url)
+        {
+            return !blacklistUrlPattern.isEmpty() && blacklistUrlPattern.stream().anyMatch(p -> p.matcher(url).find());
+        }
+
+        public List<String> getBlacklistUrl()
+        {
+            return blacklistUrl;
+        }
+
+        public void setBlacklistUrl(List<String> blacklistUrl)
+        {
+            this.blacklistUrl = blacklistUrl;
+            this.blacklistUrlPattern.clear();
+            this.blacklistUrl.forEach(url -> {
+                this.blacklistUrlPattern.add(Pattern.compile(url.replaceAll("\\*\\*", "(.*?)"), Pattern.CASE_INSENSITIVE));
+            });
+        }
+    }
+
+}
+```
+然后在配置文件中增加黑名单，这样/user/list这个URL就不能被访问了
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        # 系统模块
+        - id: pmhub-system
+          uri: lb://pmhub-system
+          predicates:
+            - Path=/system/**
+          filters:
+            - StripPrefix=0
+            - name: BlackListUrlFilter
+              args:
+                blacklistUrl:
+                - /user/list
+```
+
+
+
+下面这个例子是禁止访问的IP
+
+```java
+@Service
+public class BlacklistService {
+    private Set<String> blacklistIps = new HashSet<>();
+
+    public void addToBlacklist(String ip) {
+        blacklistIps.add(ip);
+    }
+
+    public Set<String> getBlacklist() {
+        return blacklistIps;
+    }
+}
+
+// 在过滤器中注入并使用
+@Component
+public class IpBlacklistFilter implements GlobalFilter {
+    @Autowired
+    private BlacklistService blacklistService;
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String clientIp = getClientIp(exchange);
+        if (blacklistService.getBlacklist().contains(clientIp)) {
+            exchange.getResponse().setStatusCode(HttpStatus.FORBIDDEN);
+            return exchange.getResponse().setComplete();// 结束连接
+        }
+        return chain.filter(exchange);// 或者放行
+    }
+}
+```
+
+## Gateway白名单
+
+```yaml
+# 不校验白名单
+ignore:
+  whites:
+    - /auth/logout
+    - /auth/login
+```
+
+全局过滤器中增加下面的校验
+
+```java
+// 跳过不需要验证的路径
+if (StringUtils.matches(url, ignoreWhite.getWhites())) {
+    return chain.filter(exchange);
+}
+```
+
+# 关键问题
+
+## 有 Nginx 了为什么还要 SpringCloud Gateway 做网关，两者有啥区别？
+
+Nginx 属于前置网关，擅长处理静态资源、SSL 加密和简单的流量管理，但不支持动态路由决策和复杂的业务逻辑。
+Spring Cloud Gateway 是专门为微服务架构设计的，更加贴近业务逻辑，支持动态路由、复杂的过滤器、鉴权、限流等。
+在生产环境中，通常会把两者结合起来，Nginx 用来处理静态资源和高并发流量，Spring Cloud Gateway 用来实现动态路由、权限校验和业务逻辑处理。
+
+```
+[客户端]
+    ↓
+[Nginx] — 负载均衡/静态资源代理
+    ↓
+[Spring Cloud Gateway] — 动态路由/业务逻辑处理
+    ↓
+[微服务集群]
+```
+
+## 你是如何统计接口调用耗时情况的？具体实现细节是什么？
+
+接口调用耗时情况的统计是通过记录接口访问的开始时间和结束时间来实现的。
+
+1. 在接口调用开始时，记录当前时间戳，并将其存储在 ServerWebExchange 的属性中
+
+   ```java
+   exchange.getAttributes().put(BEGIN_VISIT_TIME, System.currentTimeMillis());
+   ```
+
+2. 在接口调用结束时，通过 Mono.fromRunnable 的 then 方法，获取存储的开始时间，计算当前时间与开始时间的差值，即为接口调用的耗时。
+
+   ```java
+   return chain.filter(exchange).then(Mono.fromRunnable(() -> {
+       try {
+           Long beginVisitTime = exchange.getAttribute(BEGIN_VISIT_TIME);
+           if (beginVisitTime != null) {
+               URI uri = exchange.getRequest().getURI();
+               Map<String, Object> logData = new HashMap<>();
+               logData.put("host", uri.getHost());
+               logData.put("port", uri.getPort());
+               logData.put("path", uri.getPath());
+               logData.put("query", uri.getRawQuery());
+               logData.put("duration", (System.currentTimeMillis() - beginVisitTime) + "ms");
+   
+               log.info("访问接口信息: {}", logData);
+               log.info("我是美丽分割线: ###################################################");
+           }
+       } catch (Exception e) {
+           log.error("记录日志时发生异常: ", e);
+       }
+   }));
+   ```
+
+   
